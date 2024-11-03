@@ -1,0 +1,292 @@
+#!/bin/bash
+
+# Vérification que le script est exécuté en tant que root
+if [[ $EUID -ne 0 ]]; then
+   echo "Ce script doit être exécuté en tant que root" 
+   exit 1
+fi
+
+# Variables de configuration
+MYSQL_ROOT_PASSWORD=$(openssl rand -base64 24)
+NEXTCLOUD_DB_PASSWORD=$(openssl rand -base64 24)
+NEXTCLOUD_ADMIN_PASSWORD=$(openssl rand -base64 12)
+DOMAIN_NAME="192.168.1.117" # Changez ceci pour votre nom de domaine
+NEXTCLOUD_VERSION="30.0.1" # Vérifiez la dernière version stable de Nextcloud
+
+# Fonction pour vérifier les erreurs
+check_error() {
+    if [ $? -ne 0 ]; then
+        echo "Une erreur est survenue: $1"
+        exit 1
+    fi
+}
+
+# Fonction pour configurer l'adresse IP dans config.php, sauf pour dbhost
+configure_ip_in_config() {
+    echo "Configuration automatique de l'adresse IP dans config.php..."
+    IP_ADDRESS=$(ip a | grep 'inet ' | awk '{print $2}' | cut -d/ -f1 | grep -E "^192\.168\.")
+
+    sed -i "s/'localhost'/'$IP_ADDRESS'/g" /var/www/nextcloud/config/config.php
+    sed -i "s/'dbhost' => '$IP_ADDRESS'/'dbhost' => 'localhost'/g" /var/www/nextcloud/config/config.php
+    check_error "Mise à jour de config.php échouée"
+}
+
+# Arrêter Apache2 au début du script
+echo "Arrêt de Apache2..."
+systemctl stop apache2 || echo "Apache2 n'était pas en cours d'exécution."
+
+# Mise à jour du système
+echo "Mise à jour du système..."
+apt update
+check_error "Impossible de mettre à jour apt"
+apt upgrade -y
+check_error "Impossible de mettre à jour le système"
+
+# Installation des dépendances pour Debian 12.7.0 avec PHP 8.2
+echo "Installation des dépendances..."
+apt install -y apache2 \
+    libapache2-mod-php8.2 \
+    mariadb-server \
+    php8.2 \
+    php8.2-fpm \
+    php8.2-apcu \
+    php8.2-bcmath \
+    php8.2-cli \
+    php8.2-common \
+    php8.2-curl \
+    php8.2-gd \
+    php8.2-gmp \
+    php8.2-imagick \
+    php8.2-intl \
+    php8.2-mbstring \
+    php8.2-mysql \
+    php8.2-zip \
+    php8.2-xml \
+    php8.2-bz2 \
+    php8.2-ldap \
+    php8.2-opcache \
+    php8.2-soap \
+    php8.2-redis \
+    unzip \
+    wget \
+    imagemagick \
+    redis-server \
+    acl \
+    sudo \
+    cron
+check_error "Installation des dépendances échouée"
+
+# Configuration PHP-FPM
+echo "Configuration de PHP-FPM..."
+systemctl enable php8.2-fpm
+systemctl start php8.2-fpm
+check_error "Démarrage de PHP-FPM échoué"
+
+# Démarrage et activation des services
+systemctl enable apache2
+systemctl enable mariadb
+systemctl enable redis-server
+
+systemctl start mariadb
+systemctl start redis-server
+check_error "Impossible de démarrer les services"
+
+# Configuration de MariaDB
+echo "Configuration de MariaDB..."
+mysql -u root <<EOF
+ALTER USER 'root'@'localhost' IDENTIFIED BY '$MYSQL_ROOT_PASSWORD';
+DELETE FROM mysql.user WHERE User='';
+DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
+DROP DATABASE IF EXISTS test;
+DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
+FLUSH PRIVILEGES;
+EOF
+check_error "Configuration initiale de MariaDB échouée"
+
+# Création de la base de données Nextcloud
+echo "Création de la base de données..."
+mysql -u root -p$MYSQL_ROOT_PASSWORD <<EOF
+CREATE DATABASE nextcloud CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+CREATE USER 'nextcloud'@'localhost' IDENTIFIED BY '$NEXTCLOUD_DB_PASSWORD';
+GRANT ALL PRIVILEGES ON nextcloud.* TO 'nextcloud'@'localhost';
+FLUSH PRIVILEGES;
+EOF
+check_error "Création de la base de données échouée"
+
+# Téléchargement et vérification de Nextcloud
+echo "Téléchargement de Nextcloud..."
+cd /tmp
+wget https://download.nextcloud.com/server/releases/nextcloud-$NEXTCLOUD_VERSION.zip
+check_error "Téléchargement de Nextcloud échoué"
+wget https://download.nextcloud.com/server/releases/nextcloud-$NEXTCLOUD_VERSION.zip.asc
+check_error "Téléchargement de la signature échoué"
+
+# Installation de Nextcloud
+unzip -q nextcloud-$NEXTCLOUD_VERSION.zip
+check_error "Extraction de Nextcloud échouée"
+
+rm -rf /var/www/nextcloud
+mv nextcloud /var/www/
+check_error "Déplacement des fichiers échoué"
+
+# Création du dossier data
+mkdir -p /var/www/nextcloud/data
+check_error "Création du dossier data échouée"
+
+# Configuration des permissions
+chown -R www-data:www-data /var/www/nextcloud
+chmod +x /var/www/nextcloud/occ
+find /var/www/nextcloud/ -type d -exec chmod 750 {} \;
+find /var/www/nextcloud/ -type f -exec chmod 640 {} \;
+setfacl -dR -m u:www-data:rwx -m u:root:rwx /var/www/nextcloud/data
+check_error "Configuration des permissions échouée"
+
+# Configuration d'Apache avec support PHP-FPM
+echo "Configuration d'Apache..."
+cat > /etc/apache2/sites-available/nextcloud.conf <<EOF
+<VirtualHost *:80>
+    ServerAdmin webmaster@localhost
+    DocumentRoot /var/www/nextcloud
+    ServerName $DOMAIN_NAME
+
+    <Directory /var/www/nextcloud/>
+        Options +FollowSymlinks
+        AllowOverride All
+        Require all granted
+        
+        <IfModule mod_dav.c>
+            Dav off
+        </IfModule>
+
+        SetEnv HOME /var/www/nextcloud
+        SetEnv HTTP_HOME /var/www/nextcloud
+    </Directory>
+
+    <FilesMatch \.php$>
+        SetHandler "proxy:unix:/run/php/php8.2-fpm.sock|fcgi://localhost"
+    </FilesMatch>
+
+    ErrorLog \${APACHE_LOG_DIR}/nextcloud_error.log
+    CustomLog \${APACHE_LOG_DIR}/nextcloud_access.log combined
+</VirtualHost>
+EOF
+check_error "Création de la configuration Apache échouée"
+
+# Configuration PHP optimisée pour Debian 12.7.0
+echo "Configuration de PHP..."
+cat > /etc/php/8.2/fpm/conf.d/nextcloud.ini <<EOF
+memory_limit = 512M
+upload_max_filesize = 500M
+post_max_size = 500M
+max_execution_time = 300
+date.timezone = Europe/Paris
+opcache.enable=1
+opcache.interned_strings_buffer=8
+opcache.max_accelerated_files=10000
+opcache.memory_consumption=128
+opcache.save_comments=1
+opcache.revalidate_freq=1
+opcache.jit=1255
+opcache.jit_buffer_size=128M
+EOF
+check_error "Configuration de PHP échouée"
+
+# Activation des modules Apache nécessaires
+a2enmod proxy_fcgi setenvif rewrite headers env dir mime ssl proxy
+a2enconf php8.2-fpm
+check_error "Activation des modules Apache échouée"
+
+# Activation du site Nextcloud
+a2ensite nextcloud.conf
+check_error "Activation du site Nextcloud échouée"
+
+# Redémarrer Apache et PHP-FPM
+echo "Redémarrage des services..."
+systemctl restart apache2
+systemctl restart php8.2-fpm
+check_error "Redémarrage des services échoué"
+
+# Installation automatique de Nextcloud
+echo "Installation de Nextcloud..."
+sudo -u www-data php /var/www/nextcloud/occ maintenance:install \
+    --database "mysql" \
+    --database-name "nextcloud" \
+    --database-user "nextcloud" \
+    --database-pass "$NEXTCLOUD_DB_PASSWORD" \
+    --admin-user "admin" \
+    --admin-pass "$NEXTCLOUD_ADMIN_PASSWORD"
+check_error "Installation de Nextcloud échouée"
+
+# Remplacement automatique de localhost par IP dans config.php, sauf pour dbhost
+configure_ip_in_config
+
+# Désactivation du mode maintenance
+sudo -u www-data php /var/www/nextcloud/occ maintenance:mode --off
+
+# Installation des applications Nextcloud
+echo "Installation des applications Nextcloud..."
+apps=(
+    "files_pdfviewer"
+    "notifications"
+    "files_sharing"
+    "deck"
+    "passwords"
+    "spreed"
+    "groupfolders"
+    "workflowengine"
+    "calendar"
+    "contacts"
+)
+
+for app in "${apps[@]}"; do
+    echo "Installation de l'application $app..."
+    sudo -u www-data php /var/www/nextcloud/occ app:enable "$app"
+    check_error "Échec de l'installation de l'application $app"
+done
+
+# Redémarrage d'Apache après installation des applications
+systemctl restart apache2
+check_error "Redémarrage d'Apache échoué après installation des applications"
+
+# Récapitulatif
+echo "-------------------------------------"
+echo "Installation terminée avec succès !"
+echo "-------------------------------------"
+echo "Voici les détails de votre installation Nextcloud :"
+echo "---------------------------------------------------"
+echo "Nom de domaine : $DOMAIN_NAME"
+echo "Nom d'utilisateur administrateur : admin"
+echo "Mot de passe administrateur : $NEXTCLOUD_ADMIN_PASSWORD"
+echo "Nom de la base de données : nextcloud"
+echo "Utilisateur de la base de données : nextcloud"
+echo "Mot de passe de la base de données : $NEXTCLOUD_DB_PASSWORD"
+echo "Mot de passe root de MySQL : $MYSQL_ROOT_PASSWORD"
+echo "---------------------------------------------------"
+echo "Pour accéder à votre instance Nextcloud, visitez : http://$DOMAIN_NAME"
+echo "---------------------------------------------------"
+
+# Enregistrement du récapitulatif dans un fichier
+RECAP_FILE="/var/www/nextcloud/installation_summary.txt"
+{
+    echo "-------------------------------------"
+    echo "Installation terminée avec succès !"
+    echo "-------------------------------------"
+    echo "Voici les détails de votre installation Nextcloud :"
+    echo "---------------------------------------------------"
+    echo "Nom de domaine : $DOMAIN_NAME"
+    echo "Nom d'utilisateur administrateur : admin"
+    echo "Mot de passe administrateur : $NEXTCLOUD_ADMIN_PASSWORD"
+    echo "Nom de la base de données : nextcloud"
+    echo "Utilisateur de la base de données : nextcloud"
+    echo "Mot de passe de la base de données : $NEXTCLOUD_DB_PASSWORD"
+    echo "Mot de passe root de MySQL : $MYSQL_ROOT_PASSWORD"
+    echo "---------------------------------------------------"
+    echo "Pour accéder à votre instance Nextcloud, visitez : http://$DOMAIN_NAME"
+    echo "---------------------------------------------------"
+} > "$RECAP_FILE"
+
+# Changer les permissions du fichier de récapitulatif
+chown www-data:www-data "$RECAP_FILE"
+chmod 640 "$RECAP_FILE"
+
+echo "Le récapitulatif a été enregistré dans $RECAP_FILE"
